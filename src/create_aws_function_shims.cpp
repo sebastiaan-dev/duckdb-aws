@@ -8,9 +8,11 @@ namespace duckdb {
 
 namespace {
 
-static constexpr const char *REMOVED_MESSAGE =
-    "load_aws_credentials is no longer supported. Use `CREATE SECRET cfg (TYPE S3, PROVIDER credential_chain)` "
-    "instead.";
+static constexpr const char *REMOVED_MESSAGE = "load_aws_credentials is no longer supported. Configure AWS credentials "
+                                               "with "
+                                               "`CREATE SECRET cfg (TYPE S3, PROVIDER credential_chain)`. "
+                                               "To use a named profile, add `CHAIN 'config', PROFILE 'profile_name'`. "
+                                               "See https://duckdb.org/docs/current/core_extensions/aws.";
 
 static unique_ptr<FunctionData> LoadAWSCredentialsBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &,
                                                        vector<Identifier> &) {
