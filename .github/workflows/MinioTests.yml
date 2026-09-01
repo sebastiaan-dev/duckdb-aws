@@ -74,6 +74,34 @@ jobs:
           export AWS_CONFIG_FILE="$HOME/.aws/config";
           export AWS_SHARED_CREDENTIALS_FILE="$HOME/.aws/credentials";
           make test
+      - name: Prepare AWS secret bug reproducers
+        shell: bash
+        run: |
+          ./scripts/setup_aws_secret_bug_repro.sh "$RUNNER_TEMP/aws-secret-bug-repro"
+
+      - name: Start local STS test server
+        shell: bash
+        run: |
+          python3 ./scripts/aws_secret_sts_test_server.py >"$RUNNER_TEMP/aws-secret-sts.log" 2>&1 &
+          echo "$!" >"$RUNNER_TEMP/aws-secret-sts.pid"
+          sleep 1
+
+      - name: Run AWS secret bug reproducers
+        shell: bash
+        env:
+          DUCKDB_AWS_SECRET_BUG_REPRO: 1
+          AWS_CONFIG_FILE: ${{ runner.temp }}/aws-secret-bug-repro/config
+          AWS_SHARED_CREDENTIALS_FILE: ${{ runner.temp }}/aws-secret-bug-repro/credentials
+          AWS_PROFILE: wrong-repro
+          AWS_ENDPOINT_URL_STS: http://127.0.0.1:8898
+          AWS_EC2_METADATA_DISABLED: 'true'
+        run: |
+          for test in \
+            test/sql/env/aws_secret_bug_source_profile.test \
+            test/sql/env/aws_secret_bug_config_role_metadata.test
+          do
+            ./build/release/test/unittest "$test"
+          done
 
       - name: Run Env tests
         shell: bash
