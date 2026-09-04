@@ -428,6 +428,13 @@ AwsProvider CreateProcessProvider(const AwsCredentialOptions &opt) {
 
 AwsProvider CreateConfigProvider(const AwsCredentialOptions &opt, const Aws::Config::Profile &profile,
                                  const string &region) {
+	if (profile.GetName().empty() && opt.require_credentials) {
+		throw InvalidConfigurationException(
+		    "Secret Validation Failure: no profile '%s' found in config file %s or credentials file %s",
+		    opt.profile_name, Aws::Auth::GetConfigProfileFilename(),
+		    Aws::Auth::ProfileConfigFileAWSCredentialsProvider::GetCredentialsProfileFilename());
+	}
+
 	auto config_profile = profile;
 	if (!config_profile.GetRoleArn().empty() && !opt.assume_role.empty()) {
 		throw InvalidInputException(
@@ -600,7 +607,6 @@ void SetSecretRefresh(KeyValueSecret &secret, const case_insensitive_map_t<Value
 
 void SetSecretEndpoint(KeyValueSecret &secret, const ParsedAwsSecret &opt) {
 	auto endpoint_lu = secret.secret_map.find("endpoint");
-
 	if (endpoint_lu != secret.secret_map.end() && !endpoint_lu->second.ToString().empty()) {
 		return;
 	}
