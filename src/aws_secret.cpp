@@ -233,7 +233,7 @@ vector<string> ResolveScope(const CreateSecretInput &input) {
 	throw InternalException("Unknown secret type found in aws extension: '%s'", input.type);
 }
 
-string ResolveProfileName(CreateSecretInput &input) {
+string ResolveProfileName(const CreateSecretInput &input) {
 	string profile = TryGetStringParam(input, "profile");
 
 	if (profile.empty()) {
@@ -291,13 +291,16 @@ const AwsOptionDefinition *FindAwsOptionDefinition(const string &name) {
 	return nullptr;
 }
 
-ParsedAwsSecret ParseOptions(CreateSecretInput &input) {
+ParsedAwsSecret ParseOptions(const CreateSecretInput &input) {
 	ParsedAwsSecret opt {};
 
 	opt.name = input.name;
 	opt.type = input.type;
 	opt.scope = ResolveScope(input);
-	opt.refresh = TryGetStringParam(input, "refresh");
+	opt.refresh = StringUtil::Lower(TryGetStringParam(input, "refresh"));
+	if (!opt.refresh.empty() && opt.refresh != "auto") {
+		throw InvalidInputException("Unknown AWS refresh mode: `%s`", opt.refresh);
+	}
 
 	auto &credentials = opt.credentials;
 	credentials.profile_provided = input.options.find("profile") != input.options.end();
@@ -451,18 +454,15 @@ AwsProvider CreateConfigProvider(const AwsCredentialOptions &opt, const Aws::Con
 
 AwsProvider CreateCredentialProvider(const AwsCredentialOptions &options, const Aws::Config::Profile &profile,
                                      const string &region) {
-	vector<AwsProvider> providers;
-
 	// If the user has not supplied a chain, fall back to SDK default behavior.
 	if (options.credential_chain.empty()) {
 		if (!options.profile_provided) {
 			return std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>();
 		}
-
-		providers.emplace_back(
-		    std::make_shared<Aws::Auth::ProfileConfigFileAWSCredentialsProvider>(options.profile_name.c_str()));
-		return std::make_shared<DuckDBAwsCredentialsProviderChain>(providers);
+		return std::make_shared<Aws::Auth::ProfileConfigFileAWSCredentialsProvider>(options.profile_name.c_str());
 	}
+
+	vector<AwsProvider> providers;
 
 	for (const auto &chain : StringUtil::Split(options.credential_chain, ';')) {
 		if (chain == "sts") {
@@ -495,11 +495,11 @@ AwsProvider CreateCredentialProvider(const AwsCredentialOptions &options, const 
 	return std::make_shared<DuckDBAwsCredentialsProviderChain>(providers);
 }
 
-bool HasAssumeRole(const Aws::Config::Profile &profile, const AwsCredentialOptions &opt) {
-	if (opt.credential_chain == "sts") {
+bool HasAssumeRole(const Aws::Config::Profile &profile, const AwsCredentialOptions &opt, const std::string &chain) {
+	if (chain == "sts") {
 		return true;
 	}
-	if (opt.credential_chain == "config") {
+	if (chain == "config") {
 		// In this case the configuration file led to the creation of an STS provider.
 		if (!profile.GetRoleArn().empty() || !opt.assume_role.empty()) {
 			return true;
@@ -529,7 +529,8 @@ AwsCredentialResult LoadCredentials(const AwsCredentialOptions &opt, const Aws::
 		credentials = provider->GetAWSCredentials();
 	}
 
-	return {std::move(credentials), std::move(chain), HasAssumeRole(profile, opt)};
+	const bool assumed_role = HasAssumeRole(profile, opt, chain);
+	return {std::move(credentials), std::move(chain), assumed_role};
 }
 
 void ValidateCredentials(const AwsCredentialResult &result, const AwsCredentialOptions &opt) {
@@ -641,9 +642,7 @@ unique_ptr<KeyValueSecret> BuildSecret(const ParsedAwsSecret &opt, const case_in
 	}
 
 	SetSecretRefresh(*secret, input_options, refresh);
-	// Set endpoint defaults TODO: move to consumer side of secret
 	SetSecretEndpoint(*secret, opt);
-	// Set endpoint defaults TODO: move to consumer side of secret
 	SetSecretUrlType(*secret, opt.type);
 
 	return secret;
