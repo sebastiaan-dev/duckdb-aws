@@ -80,12 +80,7 @@ struct AwsOptionDefinition {
 	bool redact;
 };
 
-struct AwsOptions {
-	Identifier name;
-	Identifier type;
-	vector<string> scope;
-	string account_id;
-	bool account_id_provided;
+struct AwsCredentialOptions {
 	string profile_name;
 	bool profile_provided;
 	string assume_role;
@@ -93,12 +88,29 @@ struct AwsOptions {
 	string credential_chain;
 	string web_identity_token_file;
 	string session_name;
-	string refresh;
-	string rds_user;
-	string rds_host;
-	string rds_port;
-	string rds_template_secret_name;
 	bool require_credentials;
+};
+
+struct R2SecretOptions {
+	string account_id;
+	bool account_id_provided;
+};
+
+struct RdsSecretOptions {
+	string user;
+	string host;
+	string port;
+	string template_secret_name;
+};
+
+struct ParsedAwsSecret {
+	Identifier name;
+	Identifier type;
+	vector<string> scope;
+	AwsCredentialOptions credentials;
+	R2SecretOptions r2;
+	RdsSecretOptions rds;
+	string refresh;
 };
 
 struct AwsCredentialResult {
@@ -150,7 +162,7 @@ public:
 	}
 };
 
-string BuildCredentialErrorMessage(const string &chain, const AwsOptions &opt) {
+string BuildCredentialErrorMessage(const string &chain, const AwsCredentialOptions &opt) {
 	// These chains generate new credentials; assuming a role does so as well.
 	const auto verb = chain == "sts" || chain == "sso" || chain == "instance" || chain == "container" ||
 	                          chain == "process" || chain == "web_identity" || !opt.assume_role.empty()
@@ -279,46 +291,56 @@ const AwsOptionDefinition *FindAwsOptionDefinition(const string &name) {
 	return nullptr;
 }
 
-AwsOptions ParseOptions(CreateSecretInput &input) {
-	AwsOptions opt;
+ParsedAwsSecret ParseOptions(CreateSecretInput &input) {
+	ParsedAwsSecret opt {};
 
 	opt.name = input.name;
 	opt.type = input.type;
 	opt.scope = ResolveScope(input);
-	opt.profile_provided = input.options.find("profile") != input.options.end();
-	opt.profile_name = ResolveProfileName(input);
-	opt.assume_role = TryGetStringParam(input, "assume_role_arn");
-	opt.external_id = TryGetStringParam(input, "external_id");
-	opt.credential_chain = TryGetStringParam(input, "chain");
-	opt.web_identity_token_file = TryGetStringParam(input, "web_identity_token_file");
-	opt.session_name = TryGetStringParam(input, "session_name");
 	opt.refresh = TryGetStringParam(input, "refresh");
-	opt.rds_user = TryGetStringParam(input, "rds_user");
-	opt.rds_host = TryGetStringParam(input, "rds_host");
-	opt.rds_port = TryGetStringParam(input, "rds_port");
-	opt.rds_template_secret_name = TryGetStringParam(input, "rds_template_secret_name");
-	opt.require_credentials = RequiresCredentials(input);
 
-	auto account_id = input.options.find("account_id");
-	opt.account_id_provided = account_id != input.options.end();
-	if (opt.account_id_provided) {
-		opt.account_id = account_id->second.ToString();
+	auto &credentials = opt.credentials;
+	credentials.profile_provided = input.options.find("profile") != input.options.end();
+	credentials.profile_name = ResolveProfileName(input);
+	credentials.assume_role = TryGetStringParam(input, "assume_role_arn");
+	credentials.external_id = TryGetStringParam(input, "external_id");
+	credentials.credential_chain = TryGetStringParam(input, "chain");
+	credentials.web_identity_token_file = TryGetStringParam(input, "web_identity_token_file");
+	credentials.session_name = TryGetStringParam(input, "session_name");
+	credentials.require_credentials = RequiresCredentials(input);
+
+	if (opt.type == "rds") {
+		auto &rds = opt.rds;
+		rds.user = TryGetStringParam(input, "rds_user");
+		rds.host = TryGetStringParam(input, "rds_host");
+		rds.port = TryGetStringParam(input, "rds_port");
+		rds.template_secret_name = TryGetStringParam(input, "rds_template_secret_name");
+	}
+
+	if (opt.type == "r2") {
+		auto &r2 = opt.r2;
+		auto account_id = input.options.find("account_id");
+		r2.account_id_provided = account_id != input.options.end();
+		if (r2.account_id_provided) {
+			r2.account_id = account_id->second.ToString();
+		}
 	}
 
 	return opt;
 }
 
-void ValidateProfile(AwsOptions &opt) {
-	if (!opt.assume_role.empty() && opt.credential_chain.empty()) {
+void ValidateOptions(const ParsedAwsSecret &opt) {
+	if (!opt.credentials.assume_role.empty() && opt.credentials.credential_chain.empty()) {
 		throw InvalidConfigurationException("Must pass CHAIN value when passing ASSUME_ROLE_ARN");
 	}
 
-	if (opt.type == "rds" && opt.credential_chain.empty()) {
+	if (opt.type == "rds" && opt.credentials.credential_chain.empty()) {
 		throw InvalidConfigurationException("Invalid RDS secret parameters, 'CHAIN' option must be specified");
 	}
 }
 
-AwsProvider CreateSTSProvider(const AwsOptions &opt, const Aws::Config::Profile &profile, const string &region) {
+AwsProvider CreateSTSProvider(const AwsCredentialOptions &opt, const Aws::Config::Profile &profile,
+                              const string &region) {
 	string assume_role_arn = opt.assume_role.empty() ? profile.GetRoleArn() : opt.assume_role;
 	string external_id = opt.external_id.empty() ? profile.GetExternalId() : opt.external_id;
 
@@ -341,7 +363,7 @@ AwsProvider CreateSTSProvider(const AwsOptions &opt, const Aws::Config::Profile 
 	    assume_role_arn, Aws::String(), external_id, Aws::Auth::DEFAULT_CREDS_LOAD_FREQ_SECONDS, sts_client);
 }
 
-AwsProvider CreateSSOProvider(const AwsOptions &opt) {
+AwsProvider CreateSSOProvider(const AwsCredentialOptions &opt) {
 	auto sso_config = Aws::MakeShared<Aws::Client::ClientConfiguration>("DuckDBAwsSSO");
 	if (!SELECTED_CURL_CERT_PATH.empty()) {
 		sso_config->caFile = SELECTED_CURL_CERT_PATH;
@@ -369,7 +391,7 @@ AwsProvider CreateContainerProvider() {
 	return provider;
 }
 
-AwsProvider CreateWebIdentityProvider(const AwsOptions &opt, const Aws::Config::Profile &profile,
+AwsProvider CreateWebIdentityProvider(const AwsCredentialOptions &opt, const Aws::Config::Profile &profile,
                                       const string &region) {
 	Aws::Client::ClientConfiguration::CredentialProviderConfiguration config;
 
@@ -397,11 +419,12 @@ AwsProvider CreateWebIdentityProvider(const AwsOptions &opt, const Aws::Config::
 	return std::make_shared<Aws::Auth::STSAssumeRoleWebIdentityCredentialsProvider>(config);
 }
 
-AwsProvider CreateProcessProvider(const AwsOptions &opt) {
+AwsProvider CreateProcessProvider(const AwsCredentialOptions &opt) {
 	return std::make_shared<Aws::Auth::ProcessCredentialsProvider>(opt.profile_name);
 }
 
-AwsProvider CreateConfigProvider(const AwsOptions &opt, const Aws::Config::Profile &profile, const string &region) {
+AwsProvider CreateConfigProvider(const AwsCredentialOptions &opt, const Aws::Config::Profile &profile,
+                                 const string &region) {
 	auto config_profile = profile;
 	if (!config_profile.GetRoleArn().empty() && !opt.assume_role.empty()) {
 		throw InvalidInputException(
@@ -426,7 +449,7 @@ AwsProvider CreateConfigProvider(const AwsOptions &opt, const Aws::Config::Profi
 	return std::make_shared<Aws::Auth::ProfileConfigFileAWSCredentialsProvider>(opt.profile_name.c_str());
 }
 
-AwsProvider CreateCredentialProvider(const AwsOptions &options, const Aws::Config::Profile &profile,
+AwsProvider CreateCredentialProvider(const AwsCredentialOptions &options, const Aws::Config::Profile &profile,
                                      const string &region) {
 	vector<AwsProvider> providers;
 
@@ -472,12 +495,12 @@ AwsProvider CreateCredentialProvider(const AwsOptions &options, const Aws::Confi
 	return std::make_shared<DuckDBAwsCredentialsProviderChain>(providers);
 }
 
-bool HasAssumeRole(const Aws::Config::Profile &profile, const AwsOptions &opt) {
+bool HasAssumeRole(const Aws::Config::Profile &profile, const AwsCredentialOptions &opt) {
 	if (opt.credential_chain == "sts") {
 		return true;
 	}
 	if (opt.credential_chain == "config") {
-		// in this case the configuration file has lead to the creation of an STS provider
+		// In this case the configuration file led to the creation of an STS provider.
 		if (!profile.GetRoleArn().empty() || !opt.assume_role.empty()) {
 			return true;
 		}
@@ -486,7 +509,8 @@ bool HasAssumeRole(const Aws::Config::Profile &profile, const AwsOptions &opt) {
 	return false;
 }
 
-AwsCredentialResult LoadCredentials(const AwsOptions &opt, const Aws::Config::Profile &profile, const string &region) {
+AwsCredentialResult LoadCredentials(const AwsCredentialOptions &opt, const Aws::Config::Profile &profile,
+                                    const string &region) {
 	auto provider = CreateCredentialProvider(opt, profile, region);
 	auto credentials = provider->GetAWSCredentials();
 	auto chain = opt.credential_chain;
@@ -508,7 +532,7 @@ AwsCredentialResult LoadCredentials(const AwsOptions &opt, const Aws::Config::Pr
 	return {std::move(credentials), std::move(chain), HasAssumeRole(profile, opt)};
 }
 
-void ValidateCredentials(const AwsCredentialResult &result, const AwsOptions &opt) {
+void ValidateCredentials(const AwsCredentialResult &result, const AwsCredentialOptions &opt) {
 	if (!opt.require_credentials || !result.credentials.IsExpiredOrEmpty()) {
 		return;
 	}
@@ -558,7 +582,7 @@ void SetSecretRefresh(KeyValueSecret &secret, const case_insensitive_map_t<Value
 	}
 }
 
-void SetSecretEndpoint(KeyValueSecret &secret, const AwsOptions &opt) {
+void SetSecretEndpoint(KeyValueSecret &secret, const ParsedAwsSecret &opt) {
 	auto endpoint_lu = secret.secret_map.find("endpoint");
 
 	if (endpoint_lu != secret.secret_map.end() && !endpoint_lu->second.ToString().empty()) {
@@ -568,8 +592,8 @@ void SetSecretEndpoint(KeyValueSecret &secret, const AwsOptions &opt) {
 	if (opt.type == "s3") {
 		secret.secret_map["endpoint"] = "s3.amazonaws.com";
 	} else if (opt.type == "r2") {
-		if (opt.account_id_provided) {
-			secret.secret_map["endpoint"] = opt.account_id + ".r2.cloudflarestorage.com";
+		if (opt.r2.account_id_provided) {
+			secret.secret_map["endpoint"] = opt.r2.account_id + ".r2.cloudflarestorage.com";
 		}
 	} else if (opt.type == "gcs") {
 		secret.secret_map["endpoint"] = "storage.googleapis.com";
@@ -590,7 +614,7 @@ void SetSecretUrlType(KeyValueSecret &secret, const Identifier &type) {
 	}
 }
 
-unique_ptr<KeyValueSecret> BuildSecret(const AwsOptions &opt, const case_insensitive_map_t<Value> &input_options,
+unique_ptr<KeyValueSecret> BuildSecret(const ParsedAwsSecret &opt, const case_insensitive_map_t<Value> &input_options,
                                        const AwsCredentialResult &result, const std::string &region) {
 	auto secret = ConstructBaseSecret(opt.scope, opt.type, opt.name);
 	auto refresh = opt.refresh;
@@ -625,8 +649,8 @@ unique_ptr<KeyValueSecret> BuildSecret(const AwsOptions &opt, const case_insensi
 	return secret;
 }
 
-void ValidateRDSOptions(const AwsOptions &opt, const string &region) {
-	if (opt.rds_user.empty() || opt.rds_host.empty() || opt.rds_port.empty() || region.empty()) {
+void ValidateRDSOptions(const RdsSecretOptions &opt, const string &region) {
+	if (opt.user.empty() || opt.host.empty() || opt.port.empty() || region.empty()) {
 		throw InvalidInputException(
 		    "Invalid RDS secret parameters, 'RDS_USER', 'RDS_HOST', 'RDS_PORT' and 'REGION' options must be specified");
 	}
@@ -656,31 +680,32 @@ string GenerateRDSSecretToken(const std::shared_ptr<Aws::Auth::AWSCredentialsPro
 	return token;
 }
 
-unique_ptr<KeyValueSecret> BuildRDSSecret(const AwsOptions &opt, const case_insensitive_map_t<Value> &input_options,
+unique_ptr<KeyValueSecret> BuildRDSSecret(const ParsedAwsSecret &opt,
+                                          const case_insensitive_map_t<Value> &input_options,
                                           const AwsProvider &provider, const string &region) {
 	auto secret = ConstructBaseSecret(opt.scope, opt.type, opt.name);
-	if (opt.rds_template_secret_name.empty()) {
+	if (opt.rds.template_secret_name.empty()) {
 		for (const auto &option : input_options) {
 			secret->secret_map[Identifier(option.first)] = option.second;
 		}
 		return secret;
 	}
 
-	auto token = GenerateRDSSecretToken(provider, opt.rds_user, opt.rds_host, opt.rds_port, region);
+	auto token = GenerateRDSSecretToken(provider, opt.rds.user, opt.rds.host, opt.rds.port, region);
 	secret->secret_map["session_token"] = Value(token);
 	return secret;
 }
 
 unique_ptr<BaseSecret> CreateAWSSecretFromCredentialChain(ClientContext &ctx, CreateSecretInput &input) {
 	auto options = ParseOptions(input);
-	ValidateProfile(options);
+	ValidateOptions(options);
 
-	auto profile = LoadProfile(options.profile_name);
-	auto region = ResolveAwsRegion(ctx, TryGetStringParam(input, "region"), options.profile_name);
+	auto profile = LoadProfile(options.credentials.profile_name);
+	auto region = ResolveAwsRegion(ctx, TryGetStringParam(input, "region"), options.credentials.profile_name);
 
 	if (options.type == "rds") {
-		ValidateRDSOptions(options, region);
-		auto provider = CreateCredentialProvider(options, profile, region);
+		ValidateRDSOptions(options.rds, region);
+		auto provider = CreateCredentialProvider(options.credentials, profile, region);
 		return BuildRDSSecret(options, input.options, provider, region);
 	}
 
@@ -691,8 +716,8 @@ unique_ptr<BaseSecret> CreateAWSSecretFromCredentialChain(ClientContext &ctx, Cr
 		    "profile in ~/.aws/config or configure the AWS_REGION or AWS_DEFAULT_REGION environment variables.");
 	}
 
-	auto result = LoadCredentials(options, profile, region);
-	ValidateCredentials(result, options);
+	auto result = LoadCredentials(options.credentials, profile, region);
+	ValidateCredentials(result, options.credentials);
 
 	return BuildSecret(options, input.options, result, region);
 }
