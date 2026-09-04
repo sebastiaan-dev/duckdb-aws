@@ -69,6 +69,10 @@ Aws::Client::ClientConfiguration BuildClientConfigWithCa() {
 
 namespace {
 
+//===--------------------------------------------------------------------===//
+// Configuration
+//===--------------------------------------------------------------------===//
+
 using AwsProvider = std::shared_ptr<Aws::Auth::AWSCredentialsProvider>;
 
 struct AwsOptionDefinition {
@@ -162,29 +166,9 @@ public:
 	}
 };
 
-string BuildCredentialErrorMessage(const string &chain, const AwsCredentialOptions &opt) {
-	// These chains generate new credentials; assuming a role does so as well.
-	const auto verb = chain == "sts" || chain == "sso" || chain == "instance" || chain == "container" ||
-	                          chain == "process" || chain == "web_identity" || !opt.assume_role.empty()
-	                      ? "generate"
-	                      : "create";
-	string message = StringUtil::Format("Secret Validation Failure: during `%s` using the following:\n", verb);
-
-	auto append = [&](const char *label, const string &value) {
-		if (!value.empty()) {
-			message += StringUtil::Format("%s: '%s'\n", label, value);
-		}
-	};
-
-	append("Profile", opt.profile_name);
-	append("Credential Chain", chain);
-	append("Role-arn", opt.assume_role);
-	append("External-id", opt.external_id);
-	append("Web Identity Token File", opt.web_identity_token_file);
-	append("Session Name", opt.session_name);
-
-	return message;
-}
+//===--------------------------------------------------------------------===//
+// Parsing and validation
+//===--------------------------------------------------------------------===//
 
 string TryGetStringParam(const CreateSecretInput &input, const string &param_name) {
 	auto param_lookup = input.options.find(param_name);
@@ -193,18 +177,6 @@ string TryGetStringParam(const CreateSecretInput &input, const string &param_nam
 	} else {
 		return "";
 	}
-}
-
-//! Construct common key-value secret metadata.
-unique_ptr<KeyValueSecret> ConstructBaseSecret(const vector<string> &prefix_paths_p, const Identifier &type,
-                                               const Identifier &name) {
-	auto return_value = make_uniq<KeyValueSecret>(prefix_paths_p, type, CREDENTIAL_CHAIN_PROVIDER, name);
-	for (const auto &definition : AWS_OPTION_DEFINITIONS) {
-		if (definition.redact) {
-			return_value->redact_keys.insert(definition.name);
-		}
-	}
-	return return_value;
 }
 
 vector<string> ResolveScope(const CreateSecretInput &input) {
@@ -340,6 +312,34 @@ void ValidateOptions(const ParsedAwsSecret &opt) {
 	if (opt.type == "rds" && opt.credentials.credential_chain.empty()) {
 		throw InvalidConfigurationException("Invalid RDS secret parameters, 'CHAIN' option must be specified");
 	}
+}
+
+//===--------------------------------------------------------------------===//
+// Credential resolution
+//===--------------------------------------------------------------------===//
+
+string BuildCredentialErrorMessage(const string &chain, const AwsCredentialOptions &opt) {
+	// These chains generate new credentials; assuming a role does so as well.
+	const auto verb = chain == "sts" || chain == "sso" || chain == "instance" || chain == "container" ||
+	                          chain == "process" || chain == "web_identity" || !opt.assume_role.empty()
+	                      ? "generate"
+	                      : "create";
+	string message = StringUtil::Format("Secret Validation Failure: during `%s` using the following:\n", verb);
+
+	auto append = [&](const char *label, const string &value) {
+		if (!value.empty()) {
+			message += StringUtil::Format("%s: '%s'\n", label, value);
+		}
+	};
+
+	append("Profile", opt.profile_name);
+	append("Credential Chain", chain);
+	append("Role-arn", opt.assume_role);
+	append("External-id", opt.external_id);
+	append("Web Identity Token File", opt.web_identity_token_file);
+	append("Session Name", opt.session_name);
+
+	return message;
 }
 
 AwsProvider CreateSTSProvider(const AwsCredentialOptions &opt, const Aws::Config::Profile &profile,
@@ -541,6 +541,21 @@ void ValidateCredentials(const AwsCredentialResult &result, const AwsCredentialO
 	throw InvalidConfigurationException(BuildCredentialErrorMessage(result.chain, opt));
 }
 
+//===--------------------------------------------------------------------===//
+// Secret construction
+//===--------------------------------------------------------------------===//
+
+unique_ptr<KeyValueSecret> ConstructBaseSecret(const vector<string> &prefix_paths_p, const Identifier &type,
+                                               const Identifier &name) {
+	auto return_value = make_uniq<KeyValueSecret>(prefix_paths_p, type, CREDENTIAL_CHAIN_PROVIDER, name);
+	for (const auto &definition : AWS_OPTION_DEFINITIONS) {
+		if (definition.redact) {
+			return_value->redact_keys.insert(definition.name);
+		}
+	}
+	return return_value;
+}
+
 void SetSecretExpiration(KeyValueSecret &secret, const Aws::Auth::AWSCredentials &credentials, bool assumed_role) {
 	// Store credential expiration as epoch milliseconds so consumers (e.g., duckdb-iceberg)
 	// can refresh proactively at ~80% TTL instead of guessing with a fixed timer.
@@ -648,6 +663,10 @@ unique_ptr<KeyValueSecret> BuildSecret(const ParsedAwsSecret &opt, const case_in
 	return secret;
 }
 
+//===--------------------------------------------------------------------===//
+// RDS secrets
+//===--------------------------------------------------------------------===//
+
 void ValidateRDSOptions(const RdsSecretOptions &opt, const string &region) {
 	if (opt.user.empty() || opt.host.empty() || opt.port.empty() || region.empty()) {
 		throw InvalidInputException(
@@ -694,6 +713,10 @@ unique_ptr<KeyValueSecret> BuildRDSSecret(const ParsedAwsSecret &opt,
 	secret->secret_map["session_token"] = Value(token);
 	return secret;
 }
+
+//===--------------------------------------------------------------------===//
+// Entry point
+//===--------------------------------------------------------------------===//
 
 unique_ptr<BaseSecret> CreateAWSSecretFromCredentialChain(ClientContext &ctx, CreateSecretInput &input) {
 	auto options = ParseOptions(input);
